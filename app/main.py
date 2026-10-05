@@ -75,8 +75,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     app.state.settings = settings
     app.state.db = Database(settings.db_path)
-    # One lock per collection session: serialises concurrent / out-of-order
-    # appends to the same session for the lifetime of this process.
+    # One lock per collection session: serialises appends inside *this*
+    # process so retries usually resolve without decoding twice. It does not
+    # coordinate separate service instances sharing the SQLite file; that is
+    # enforced in the database by an atomic compare-and-set transaction.
     app.state.session_locks = {}
     app.state.session_locks_guard = threading.Lock()
 
@@ -283,6 +285,64 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         result["tail"]["start"] += base
         result["tail"]["end"] += base
 
+    def _classify_against_row(
+        row, *, expected_offset: int, chunk_sha: str
+    ) -> dict:
+        """Resolve one submission against a committed session row.
+
+        Returns the stored response (as a dict) for an idempotent replay when
+        the most recent chunk is identical, otherwise raises the matching 409.
+        Used both on the in-process fast path and after losing the
+        cross-process commit race, so winners/losers follow the same rules.
+        """
+        # Idempotent retry of the most recent append: identical offset and
+        # identical content returns the stored response without producing any
+        # frame again.
+        if (
+            expected_offset == row["last_chunk_offset"]
+            and chunk_sha == row["last_chunk_sha256"]
+            and row["last_response"]
+        ):
+            response = json.loads(row["last_response"])
+            response["replayed"] = True
+            return response
+
+        # Same offset as the last committed chunk but different content is an
+        # attempted rewrite: content_mismatch takes precedence over the gap
+        # test because, after a successful append, last_chunk_offset is
+        # always smaller than received_offset.
+        if expected_offset == row["last_chunk_offset"]:
+            raise SessionAppendConflictError(
+                message=(
+                    "offset already committed but chunk content differs from the "
+                    "previously accepted fragment"
+                ),
+                details={
+                    "reason": "content_mismatch",
+                    "expected_offset": expected_offset,
+                    "received_offset": row["received_offset"],
+                    "committed_sha256": row["last_chunk_sha256"],
+                    "submitted_sha256": chunk_sha,
+                },
+            )
+
+        # Any other mismatch (stale/jumped/gapped expected_offset, including a
+        # chunk that lost a race against a different winner) leaves state
+        # untouched.
+        raise SessionAppendConflictError(
+            message=(
+                f"expected_offset {expected_offset} does not match session "
+                f"received_offset {row['received_offset']}"
+            ),
+            details={
+                "reason": "offset_mismatch",
+                "expected_offset": expected_offset,
+                "received_offset": row["received_offset"],
+                "next_offset": row["received_offset"],
+                "chunk_sha256": chunk_sha,
+            },
+        )
+
     @app.post("/sessions", status_code=201)
     async def create_session(req: CreateSessionRequest) -> dict:
         db: Database = app.state.db
@@ -308,8 +368,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def session_append(req: SessionAppendRequest) -> dict:
         db: Database = app.state.db
 
-        # Same-session appends are serialised; a second writer either observes
-        # the committed state (replay / gap / offset conflict) or waits.
+        # Same-session appends are serialised inside this process: a second
+        # writer usually observes the committed state immediately (replay /
+        # content mismatch / gap) without decoding twice. Two separate
+        # service instances are not serialised by this lock; the database
+        # compare-and-set at commit time is the cross-process boundary.
         lock = _session_lock(req.session_id)
         with lock:
             row = db.get_session(req.session_id)
@@ -333,52 +396,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
             chunk_sha = hashlib.sha256(chunk).hexdigest()
 
-            # Idempotent retry of the most recent append: identical offset and
-            # identical content returns the stored response without producing
-            # any frame again.
+            # Fast path: another append in this process already established
+            # the result (retry / rewrite / gap). Decide without decoding.
             if (
                 req.expected_offset == row["last_chunk_offset"]
-                and chunk_sha == row["last_chunk_sha256"]
-                and row["last_response"]
+                or req.expected_offset != received_offset
             ):
-                response = json.loads(row["last_response"])
-                response["replayed"] = True
-                return response
-
-            # Same offset as the last committed chunk but different content is
-            # an attempted rewrite: reject before any state change. This is
-            # checked before the gap test because, after a successful append,
-            # last_chunk_offset is always smaller than received_offset.
-            if req.expected_offset == row["last_chunk_offset"]:
-                raise SessionAppendConflictError(
-                    message=(
-                        "offset already committed but chunk content differs from the "
-                        "previously accepted fragment"
-                    ),
-                    details={
-                        "reason": "content_mismatch",
-                        "expected_offset": req.expected_offset,
-                        "received_offset": received_offset,
-                        "committed_sha256": row["last_chunk_sha256"],
-                        "submitted_sha256": chunk_sha,
-                    },
-                )
-
-            # Any other mismatch is rejected and leaves the state untouched:
-            # a gap caused by concurrent/out-of-order submission.
-            if req.expected_offset != received_offset:
-                raise SessionAppendConflictError(
-                    message=(
-                        f"expected_offset {req.expected_offset} does not match session "
-                        f"received_offset {received_offset}"
-                    ),
-                    details={
-                        "reason": "offset_mismatch",
-                        "expected_offset": req.expected_offset,
-                        "received_offset": received_offset,
-                        "next_offset": received_offset,
-                        "chunk_sha256": chunk_sha,
-                    },
+                return _classify_against_row(
+                    row, expected_offset=req.expected_offset, chunk_sha=chunk_sha
                 )
 
             pending_tail = base64.b64decode(tail_b64) if tail_b64 else b""
@@ -426,19 +451,28 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "replayed": False,
             }
             validated = SessionAppendResponse.model_validate(response)
+            response_json = validated.model_dump_json()
 
-            # Offset, tail and this response persist together. On error above
-            # (too large / decode failure) nothing here runs, so the offset
-            # does not advance.
-            db.save_session_append(
+            # Atomic cross-instance boundary: the UPDATE only applies while
+            # the received_offset read above is still current. If another
+            # instance committed first, its fresh state decides replay vs
+            # content_mismatch vs offset_mismatch, and nothing we decoded
+            # reaches the session.
+            fresh = db.commit_session_append(
                 req.session_id,
+                received_offset,
                 received_offset=new_offset,
                 tail_b64=new_tail_b64,
                 frames_total=new_frames_total,
                 last_chunk_offset=received_offset,
                 last_chunk_sha=chunk_sha,
-                last_response_json=validated.model_dump_json(),
+                last_response_json=response_json,
             )
+            if fresh is not None:
+                return _classify_against_row(
+                    fresh, expected_offset=req.expected_offset, chunk_sha=chunk_sha
+                )
+
             return response
 
     @app.get("/sessions/{session_id}", response_model=SessionProgressResponse)

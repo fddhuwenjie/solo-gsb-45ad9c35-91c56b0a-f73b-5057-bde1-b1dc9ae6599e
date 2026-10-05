@@ -1,0 +1,63 @@
+# Optional two-instance deployment for verification: two independent service
+# processes sharing ONE SQLite database file via the same named volume.
+#
+# The original single-instance startup is unchanged:
+#
+#   docker compose up --build
+#
+# To bring up both instances instead:
+#
+#   docker compose -f docker-compose.cluster.yml up --build
+#
+# Then use http://localhost:8000 and http://localhost:8001 interchangeably.
+# Every /sessions/append is arbitrated inside SQLite (BEGIN IMMEDIATE plus a
+# compare-and-set on received_offset), so concurrent appends from the two
+# instances cannot overwrite each other:
+#
+# * different chunks racing at the same offset -> exactly one 200, the other
+#   409 SESSION_APPEND_CONFLICT (details.reason = content_mismatch);
+# * identical chunks racing -> one normal 200, the other the same response
+#   with replayed=true, frames counted once;
+# * stale/jumped expected_offset -> 409 (details.reason = offset_mismatch);
+#   none of the 409 responses mutates session state.
+#
+# Requires byte-range locking (local/named volume); do not place the SQLite
+# file on a network filesystem without equivalent locking semantics.
+services:
+  resync-api-a:
+    image: sensor-resync-api:latest
+    build: .
+    container_name: sensor-resync-api-a
+    environment:
+      RESYNC_DB_PATH: /data/resync.db
+      RESYNC_MAX_DECODE_BYTES: "1048576"
+    ports:
+      - "8000:8000"
+    volumes:
+      - resync-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health').status==200 else 1)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  resync-api-b:
+    image: sensor-resync-api:latest
+    container_name: sensor-resync-api-b
+    environment:
+      RESYNC_DB_PATH: /data/resync.db
+      RESYNC_MAX_DECODE_BYTES: "1048576"
+    ports:
+      - "8001:8000"
+    volumes:
+      - resync-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health').status==200 else 1)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  resync-data:

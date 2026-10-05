@@ -20,9 +20,12 @@
 - **分批采集会话** `POST /sessions` + `POST /sessions/append` + `GET /sessions/{id}`：
   创建会话时固定协议**确切版本**；现场字节流按批到达时，服务把上次未决尾部拼到新分片前、
   沿用同一套重同步解码，只返回**本次新确定**的帧与丢弃区间（起止为会话累计字节位置），
-  并返回新待决尾部与下一偏移。已接收偏移、尾部与本次响应一起持久化，重启可续；最近一次
-  分片按同一偏移与内容重发返回原响应且不重复产出；同偏移不同内容、并发/乱序提交一律 409
-  拒绝且不改状态；拼合数据超限或解码报错均不推进偏移。
+  并返回新待决尾部与下一偏移。已接收偏移、尾部、累计帧数、最近一次分片及本次响应在
+  **同一数据库事务**中原子生效；即使两个服务实例共用同一个 SQLite 文件、同时读到同一
+  接收偏移并提交不同分片，后到的提交也会因偏移已移动而核对失败，不会覆盖先到的状态。
+  竞争落败后按数据库中的最新状态处理：最近一次同偏移同内容分片返回原响应（`replayed:
+  true`，不重复计帧），同偏移不同内容返回 409 `content_mismatch`，其他过期/跳跃偏移
+  返回 409 `offset_mismatch`，均不改状态；拼合数据超限或解码报错均不推进偏移。
 - **丢弃区间审计**：每次跳过都返回 `[start, end)` 区间与各候选的失败原因
   （`length_out_of_bounds` / `crc_failed` / `malformed_escape`）。
 - **结果复用**：同一协议版本 + 输入字节 SHA-256 摘要命中 SQLite 缓存，响应中
@@ -341,8 +344,47 @@ curl -s -X POST localhost:8000/sessions/append -H 'Content-Type: application/jso
 }'
 ```
 
-同一会话的并发追加按会话加锁串行化：两个**不同**分片在同一偏移竞争时，恰有一个成功、另一个
-409；两个**相同**分片竞争时，一个正常提交、另一个作为重放返回，绝不重复计数。
+同一会话的追加先按会话做**进程内**串行化（同进程的重试直接命中快速路径），而真正的
+仲裁发生在 **SQLite 事务**中：提交时以 `BEGIN IMMEDIATE` 取得写锁，并在
+`UPDATE ... WHERE session_id = ? AND received_offset = <读取时的偏移>` 上做比较设置
+（compare-and-set）。因此**两个独立服务实例共用同一个数据库文件**时，进程内锁互不
+可见也不影响正确性——后到的写入核对到偏移已被先到的提交推进，`UPDATE` 命中 0 行，其
+解码结果不会落库；随后在同一写事务中重新读出获胜状态并按上述规则给出重放 / 409。
+
+- 两个**不同**分片在同一偏移竞争时，恰有一个 200 成功、另一个 409
+  `content_mismatch`；绝不可能两个都返回成功，也不会出现后写覆盖前写。
+- 两个**相同**分片竞争时，一个正常提交、另一个作为重放返回（`replayed: true`），
+  帧只计一次。
+- 过期、迟到或跳跃的 `expected_offset` 一律 409 `offset_mismatch`；所有 409 都不
+  改动任何状态。
+
+##### 双实例共用数据库：启动与核对
+
+原有单实例启动方式保持不变（`docker compose up --build`）。需要两个实例共用一个
+SQLite 文件做核对时，使用随仓库附带的可选 compose（两个容器挂载同一个命名卷）：
+
+```bash
+docker compose -f docker-compose.cluster.yml up --build
+# 实例 A: http://localhost:8000   实例 B: http://localhost:8001
+# 两个实例的 RESYNC_DB_PATH 均为 /data/resync.db（同一命名卷 resync-data）
+```
+
+本地（无 Docker）等价启动两个进程并指向同一个数据库文件：
+
+```bash
+RESYNC_DB_PATH=/tmp/shared/resync.db uvicorn app.main:app --port 8000 &
+RESYNC_DB_PATH=/tmp/shared/resync.db uvicorn app.main:app --port 8001 &
+```
+
+注册协议、创建会话后，把**同偏移的两个不同分片分别并发打到 8000 / 8001**，预期恰有
+一个 200、另一个 409 `content_mismatch`，且两个实例随后查询到的 `received_offset` /
+`frames_total` / `last_chunk_sha256` 完全一致（只反映获胜分片）；把**同一分片**并发
+打到两个实例，预期一个正常 200、另一个 200 但 `replayed: true` 且帧数不翻倍；
+最后停掉两个实例再重启（或在另一实例上）用 `last_chunk_offset` 重发最近分片可拿到原
+响应（`replayed: true`），再按新的 `next_offset` 继续，进度不丢不重。
+
+> 注意：该仲裁依赖 SQLite 字节范围锁（WAL 模式，单写者），请让数据库位于本地盘 /
+> Docker 命名卷；网络文件系统若不提供等价锁语义则不支持多实例共用。
 
 #### 4.4 超限与解码报错都不推进偏移
 
@@ -376,7 +418,8 @@ curl -s localhost:8000/sessions/00e49c0d66904047837921d05a3090d6
 ```
 
 已接收偏移、待决尾部、累计帧数与最近一次分片（偏移 + SHA-256 + 原响应）在每个成功追加时
-**同一事务**写入 SQLite（默认 `/data/resync.db`，见上方启动/卷配置）。服务重启后用
+于**同一数据库事务**中原子写入 SQLite（默认 `/data/resync.db`，见上方启动/卷配置），并以
+`received_offset` 比较设置作为跨实例仲裁（见 4.3「双实例共用数据库」）。服务重启后用
 `GET /sessions/{id}` 读取进度，把最近一次未确认的分片按 `last_chunk_offset` 重发即可拿到
 原响应（`replayed: true`），随后用新的 `next_offset` 继续，不会丢帧也不会重复产出。
 会话不存在返回 404 `SESSION_NOT_FOUND`。
@@ -424,7 +467,7 @@ curl -s localhost:8000/sessions/00e49c0d66904047837921d05a3090d6
 | 404 | `PROTOCOL_NOT_FOUND` | 协议 ID / 版本不存在 |
 | 409 | `PROTOCOL_VERSION_CONFLICT` | 同 ID+版本已存在但定义不同 |
 | 404 | `SESSION_NOT_FOUND` | 会话 ID 不存在（追加或进度查询） |
-| 409 | `SESSION_APPEND_CONFLICT` | 会话追加：同偏移不同内容（`reason=content_mismatch`）或乱序/跳跃/并发提交（`reason=offset_mismatch`），状态不变 |
+| 409 | `SESSION_APPEND_CONFLICT` | 会话追加：同偏移不同内容（`reason=content_mismatch`）或乱序/跳跃/并发提交（`reason=offset_mismatch`）；即使两个服务实例共用同一 SQLite 文件，也由数据库内 `received_offset` 比较设置仲裁，落败者不改状态 |
 | 413 | `PAYLOAD_TOO_LARGE` | 超 `RESYNC_MAX_DECODE_BYTES`（会话中指 待决尾部 + 新分片 的拼合大小） |
 
 ## API 一览
@@ -452,12 +495,13 @@ app/
   crc.py       # 通用 CRC-16（反射/非反射）
   decoder.py   # 候选扫描、反转义、长度/CRC 校验、重同步与歧义判定
   encoder.py   # 字段写入（位域/定点反算/冲突检测）、长度与 CRC 派生、转义、回读校验
-  db.py        # SQLite：协议表 + (协议版本, 输入摘要) 结果缓存 + 采集会话状态表
+  db.py        # SQLite：协议表 + (协议版本, 输入摘要) 结果缓存 + 采集会话状态表（追加为跨进程比较设置事务）
   errors.py    # 结构化错误类型
   main.py      # FastAPI 路由与错误处理（/decode、/encode、/sessions[/append]）
-tests/         # pytest 用例（含构造 CRC 碰撞的歧义用例、编码回读校验、会话跨分片/重试/重启）
+tests/         # pytest 用例（含构造 CRC 碰撞的歧义用例、编码回读校验、会话跨分片/重试/重启/双实例竞争）
 Dockerfile
-docker-compose.yml
+docker-compose.yml            # 单实例（docker compose up --build）
+docker-compose.cluster.yml    # 可选：两实例共享一个 SQLite 文件，用于竞争核对
 ```
 
 ## 测试
@@ -476,4 +520,6 @@ LE/adjustment 长度值、不可精确表示 / min/max / 位宽 / 派生位置 /
 会话侧（`tests/test_sessions.py`）覆盖：版本固定与缺失版本 404、跨分片（含跨片同步头、
 dangling 转义符）只产出一次且偏移为累计位置、最近分片同偏移同内容重放不重复计数、同偏移异
 内容 / 乱序跳跃 / 并发竞争 409 且不改状态、拼合超限与歧义硬错不推进偏移、空/非法分片 422，
-以及关闭并重建 App（模拟服务重启）后进度/尾部持久化、重放原响应并继续追加。
+关闭并重建 App（模拟服务重启）后进度/尾部持久化、重放原响应并继续追加，以及**两个指向同一
+SQLite 文件的独立 App 实例**之间的竞争：不同分片竞争恰一胜一负（`content_mismatch`）、
+相同分片竞争一重放不重复计数、跨实例重试/续写与过期/跳跃偏移 409。

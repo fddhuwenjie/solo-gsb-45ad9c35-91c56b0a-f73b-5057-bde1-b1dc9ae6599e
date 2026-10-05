@@ -16,6 +16,7 @@ Session semantics under test:
 from __future__ import annotations
 
 import base64
+import hashlib
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
@@ -388,6 +389,151 @@ def test_concurrent_identical_chunks_produce_no_duplicates(client):
     assert all(b["next_offset"] == len(chunk) for b in bodies)
     assert all(b["frames_total"] == 1 for b in bodies)
     assert client.get(f"/sessions/{sid}").json()["frames_total"] == 1
+
+
+# ----------------------------------------------- two instances, shared DB -----
+
+
+def _two_clients(db_path):
+    """Two independent service instances sharing one SQLite database file."""
+    from fastapi.testclient import TestClient
+
+    c1 = TestClient(create_app(Settings(db_path=db_path, max_decode_bytes=1 << 20)))
+    c2 = TestClient(create_app(Settings(db_path=db_path, max_decode_bytes=1 << 20)))
+    return c1, c2
+
+
+def test_shared_db_instances_race_different_chunks_one_wins(db_path):
+    c1, c2 = _two_clients(db_path)
+    with c1, c2:
+        register(c1)  # shared schema/protocol table, visible to c2
+        sid = make_session(c1)["session_id"]
+        chunk_a = SYNC + build_logical(1, 3, 0)
+        chunk_b = SYNC + build_logical(2, 3, 0)
+        assert len(chunk_a) == len(chunk_b)
+
+        results: dict[str, tuple] = {}
+        barrier = threading.Barrier(2)
+
+        def race(tag, client, payload):
+            barrier.wait()
+            r = append(client, sid, 0, payload)
+            results[tag] = (r.status_code, r.json())
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futs = [
+                pool.submit(race, "a", c1, chunk_a),
+                pool.submit(race, "b", c2, chunk_b),
+            ]
+            for f in futs:
+                f.result()
+
+    statuses = sorted(status for status, _ in results.values())
+    assert statuses == [200, 409]
+
+    winner = next(body for status, body in results.values() if status == 200)
+    loser = next(body for status, body in results.values() if status == 409)
+    assert winner["replayed"] is False
+    assert winner["frames_total"] == 1
+    assert winner["frames"][0]["sequence"] in (1, 2)
+
+    # The late writer learns it lost against a different fragment: a
+    # content_mismatch, never a silent overwrite or a double success.
+    assert loser["error"]["code"] == "SESSION_APPEND_CONFLICT"
+    assert loser["error"]["details"]["reason"] == "content_mismatch"
+    assert (
+        loser["error"]["details"]["committed_sha256"]
+        != loser["error"]["details"]["submitted_sha256"]
+    )
+
+    # Both instances must now report the winner's single state.
+    for client in (c1, c2):
+        progress = client.get(f"/sessions/{sid}").json()
+        assert progress["received_offset"] == len(chunk_a)
+        assert progress["frames_total"] == 1
+        assert progress["last_chunk_sha256"] in (
+            hashlib.sha256(chunk_a).hexdigest(),
+            hashlib.sha256(chunk_b).hexdigest(),
+        )
+
+
+def test_shared_db_instances_race_identical_chunks_one_replays(db_path):
+    c1, c2 = _two_clients(db_path)
+    with c1, c2:
+        register(c1)
+        sid = make_session(c1)["session_id"]
+        chunk = SYNC + build_logical(1, 3, 0)
+
+        bodies: dict[str, dict] = {}
+        barrier = threading.Barrier(2)
+
+        def race(tag, client):
+            barrier.wait()
+            r = append(client, sid, 0, chunk)
+            assert r.status_code == 200, r.text
+            bodies[tag] = r.json()
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futs = [pool.submit(race, "a", c1), pool.submit(race, "b", c2)]
+            for f in futs:
+                f.result()
+
+    # Exactly one commit; the loser replays it with replayed=true and no
+    # frame is counted a second time.
+    assert sorted(b["replayed"] for b in bodies.values()) == [False, True]
+    committed = next(b for b in bodies.values() if not b["replayed"])
+    replayed = next(b for b in bodies.values() if b["replayed"])
+    assert replayed["frames"] == committed["frames"]
+    assert replayed["frames_total"] == committed["frames_total"] == 1
+    assert all(b["next_offset"] == len(chunk) for b in bodies.values())
+
+    for client in (c1, c2):
+        assert client.get(f"/sessions/{sid}").json()["frames_total"] == 1
+
+
+def test_shared_db_instances_retry_continue_and_stale_offsets(db_path):
+    c1, c2 = _two_clients(db_path)
+    with c1, c2:
+        register(c1)
+        sid = make_session(c1)["session_id"]
+        chunk1 = SYNC + build_logical(1, 3, 0)
+        chunk2 = SYNC + build_logical(2, 3, 0)
+
+        d1 = append(c1, sid, 0, chunk1).json()
+        assert d1["frames_total"] == 1
+
+        # The other instance retries the identical fragment: replay, no dup.
+        r_replay = append(c2, sid, 0, chunk1)
+        assert r_replay.status_code == 200
+        replay = r_replay.json()
+        assert replay["replayed"] is True
+        assert replay["frames"] == d1["frames"]
+        assert replay["frames_total"] == 1
+
+        # ...and continues the stream itself.
+        d2 = append(c2, sid, len(chunk1), chunk2).json()
+        assert d2["frames"][0]["sequence"] == 2
+        assert d2["frames_total"] == 2
+
+        # Same offset as the newest chunk but different content: 409
+        # content_mismatch through the instance that did not commit it.
+        r_rewrite = append(c1, sid, len(chunk1), SYNC + build_logical(9, 3, 0))
+        assert r_rewrite.status_code == 409
+        assert r_rewrite.json()["error"]["details"]["reason"] == "content_mismatch"
+
+        # An old/stale fragment (offset 0, neither last offset nor current)
+        # and a jump both stay 409 offset_mismatch and change nothing.
+        r_stale = append(c1, sid, 0, chunk1)
+        assert r_stale.status_code == 409
+        assert r_stale.json()["error"]["details"]["reason"] == "offset_mismatch"
+        r_jump = append(c2, sid, len(chunk1) + len(chunk2) + 5, b"\x09")
+        assert r_jump.status_code == 409
+        assert r_jump.json()["error"]["details"]["reason"] == "offset_mismatch"
+
+        for client in (c1, c2):
+            progress = client.get(f"/sessions/{sid}").json()
+            assert progress["received_offset"] == len(chunk1) + len(chunk2)
+            assert progress["frames_total"] == 2
 
 
 # -------------------------------------------------------------- progress -----

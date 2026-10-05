@@ -165,9 +165,10 @@ class Database:
         )
         return cur.fetchone()
 
-    def save_session_append(
+    def commit_session_append(
         self,
         session_id: str,
+        expected_received_offset: int,
         *,
         received_offset: int,
         tail_b64: str,
@@ -175,19 +176,33 @@ class Database:
         last_chunk_offset: int,
         last_chunk_sha: str,
         last_response_json: str,
-    ) -> None:
-        """Durably commit one accepted append.
+    ) -> sqlite3.Row | None:
+        """Atomically commit one accepted append.
 
-        Offset, tail and the response of the last chunk move together in a
-        single transaction, so a crash/restart never loses or duplicates work.
+        The new offset, pending tail, cumulative frame count and the last
+        chunk (offset + sha + stored response) take effect together in one
+        transaction, so a crash/restart never loses or duplicates work.
+
+        The commit only succeeds when ``received_offset`` is still the value
+        the request read before decoding. ``BEGIN IMMEDIATE`` serialises
+        writers across *processes* sharing this SQLite file (an in-process
+        lock cannot), and the ``WHERE received_offset = ?`` guard is the
+        compare-and-set: a concurrent append that landed first moves the
+        offset, so the stale update matches no row.
+
+        Returns ``None`` when this caller won the race and the row was
+        updated, or the freshly committed row when another writer won (state
+        left untouched by this caller, inside the same write transaction).
         """
-        with self.conn:
-            self.conn.execute(
+        conn = self.conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            cur = conn.execute(
                 "UPDATE sessions SET "
                 "received_offset = ?, tail_b64 = ?, frames_total = ?, "
                 "last_chunk_offset = ?, last_chunk_sha256 = ?, last_response = ?, "
                 "updated_at = datetime('now') "
-                "WHERE session_id = ?",
+                "WHERE session_id = ? AND received_offset = ?",
                 (
                     received_offset,
                     tail_b64,
@@ -196,5 +211,20 @@ class Database:
                     last_chunk_sha,
                     last_response_json,
                     session_id,
+                    expected_received_offset,
                 ),
             )
+            if cur.rowcount == 1:
+                conn.commit()
+                return None
+            # The offset moved between our read and this commit: re-read the
+            # winning state inside the same serialised transaction so the
+            # caller can decide replay vs conflict without another race.
+            fresh = conn.execute(
+                "SELECT * FROM sessions WHERE session_id = ?", (session_id,)
+            ).fetchone()
+            conn.rollback()
+            return fresh
+        except Exception:
+            conn.rollback()
+            raise
