@@ -22,7 +22,8 @@
   沿用同一套重同步解码，只返回**本次新确定**的帧与丢弃区间（起止为会话累计字节位置），
   并返回新待决尾部与下一偏移。已接收偏移、尾部与本次响应一起持久化，重启可续；最近一次
   分片按同一偏移与内容重发返回原响应且不重复产出；同偏移不同内容、并发/乱序提交一律 409
-  拒绝且不改状态；拼合数据超限或解码报错均不推进偏移。
+  拒绝且不改状态；拼合数据超限或解码报错均不推进偏移。提交以接收偏移为版本号在数据库内
+  compare-and-swap 落库，**多个服务实例共用同一 SQLite 文件**时竞争追加也不会互相覆盖。
 - **丢弃区间审计**：每次跳过都返回 `[start, end)` 区间与各候选的失败原因
   （`length_out_of_bounds` / `crc_failed` / `malformed_escape`）。
 - **结果复用**：同一协议版本 + 输入字节 SHA-256 摘要命中 SQLite 缓存，响应中
@@ -341,8 +342,12 @@ curl -s -X POST localhost:8000/sessions/append -H 'Content-Type: application/jso
 }'
 ```
 
-同一会话的并发追加按会话加锁串行化：两个**不同**分片在同一偏移竞争时，恰有一个成功、另一个
-409；两个**相同**分片竞争时，一个正常提交、另一个作为重放返回，绝不重复计数。
+同一会话的并发追加按会话加锁串行化；跨进程/多实例共用同一 SQLite 文件时，提交本身以
+**接收偏移为版本号的 compare-and-swap**（`UPDATE ... WHERE received_offset = <读取时偏移>`）
+在数据库内核对读取时的偏移仍有效，新偏移、待决尾部、累计帧数、最近分片与响应作为**一个状态**
+原子生效。因此两个**不同**分片在同一偏移竞争时，恰有一个成功、另一个 409
+（`content_mismatch`）；两个**相同**分片竞争时，一个正常提交、另一个作为重放返回
+（`replayed: true`），绝不重复计数。
 
 #### 4.4 超限与解码报错都不推进偏移
 
@@ -376,10 +381,48 @@ curl -s localhost:8000/sessions/00e49c0d66904047837921d05a3090d6
 ```
 
 已接收偏移、待决尾部、累计帧数与最近一次分片（偏移 + SHA-256 + 原响应）在每个成功追加时
-**同一事务**写入 SQLite（默认 `/data/resync.db`，见上方启动/卷配置）。服务重启后用
-`GET /sessions/{id}` 读取进度，把最近一次未确认的分片按 `last_chunk_offset` 重发即可拿到
-原响应（`replayed: true`），随后用新的 `next_offset` 继续，不会丢帧也不会重复产出。
-会话不存在返回 404 `SESSION_NOT_FOUND`。
+以**接收偏移为守卫的同一条原子 UPDATE** 写入 SQLite（默认 `/data/resync.db`，见上方启动/卷
+配置）。服务重启后用 `GET /sessions/{id}` 读取进度，把最近一次未确认的分片按
+`last_chunk_offset` 重发即可拿到原响应（`replayed: true`），随后用新的 `next_offset` 继续，
+不会丢帧也不会重复产出。会话不存在返回 404 `SESSION_NOT_FOUND`。
+
+#### 4.6 多实例共用同一 SQLite（副本部署）
+
+可以启动多个服务实例指向**同一个 SQLite 数据库文件**（同一 `RESYNC_DB_PATH`），会话追加的
+正确性不依赖进程内锁：提交时在数据库内核对读取时的接收偏移仍有效才落库，竞争落败的实例会
+重新读取最新状态，再按 4.3 的约定判定（同偏移同内容 → 重放原响应；同偏移不同内容 → 409
+`content_mismatch`；过期/跳跃偏移 → 409 `offset_mismatch`），落败方不改动任何状态。
+
+本地起两个实例（注意用可写的数据库路径）：
+
+```bash
+# 终端 1
+RESYNC_DB_PATH=/tmp/resync-shared.db uvicorn app.main:app --host 0.0.0.0 --port 8000
+# 终端 2（同一数据库文件）
+RESYNC_DB_PATH=/tmp/resync-shared.db uvicorn app.main:app --host 0.0.0.0 --port 8001
+```
+
+调用方式与单实例完全一致，客户端可任选一个实例：
+
+```bash
+# 在实例 8000 上建会话、提交第 1 片
+curl -s -X POST localhost:8000/protocols -H 'Content-Type: application/json' -d '{ ... }'
+curl -s -X POST localhost:8000/sessions -H 'Content-Type: application/json' \
+  -d '{"protocol_id": "sensor-line", "version": 1}'
+curl -s -X POST localhost:8000/sessions/append -H 'Content-Type: application/json' \
+  -d '{"session_id": "<sid>", "expected_offset": 0, "chunk_b64": "EjSqVQEDCSkJAHWbAKpVAgM="}'
+
+# 实例 8001 立即看到 8000 提交的进度，并可继续追加第 2 片
+curl -s localhost:8001/sessions/<sid>
+curl -s -X POST localhost:8001/sessions/append -H 'Content-Type: application/json' \
+  -d '{"session_id": "<sid>", "expected_offset": 17, "chunk_b64": "/2oJAKqKAA=="}'
+```
+
+两个实例同时读到同一 `next_offset` 并各自提交**不同**分片时，恰有一个返回 200，另一个收到
+409 `content_mismatch`；提交**相同**分片（如超时重试打到另一实例）时，一个正常提交、另一个
+返回 `replayed: true` 的原响应，`frames_total` 不重复累计。原有的
+`docker compose up --build` 单实例启动方式保持不变（命名卷 `resync-data` 内的数据库文件同样
+可以直接挂给第二个容器实例共用）。
 
 ## 协议声明字段
 
@@ -477,3 +520,7 @@ LE/adjustment 长度值、不可精确表示 / min/max / 位宽 / 派生位置 /
 dangling 转义符）只产出一次且偏移为累计位置、最近分片同偏移同内容重放不重复计数、同偏移异
 内容 / 乱序跳跃 / 并发竞争 409 且不改状态、拼合超限与歧义硬错不推进偏移、空/非法分片 422，
 以及关闭并重建 App（模拟服务重启）后进度/尾部持久化、重放原响应并继续追加。
+`tests/test_sessions_multi_instance.py` 用两个共享同一 SQLite 文件的独立实例核对：不同分片
+同偏移竞争恰有一个提交、落败方 409 `content_mismatch` 且状态只反映胜方；相同分片竞争一个
+提交一个重放、不重复计帧；活跃实例间交替追加与进度互见；新实例（模拟重启）读取进度、重放
+最近分片并继续追加。

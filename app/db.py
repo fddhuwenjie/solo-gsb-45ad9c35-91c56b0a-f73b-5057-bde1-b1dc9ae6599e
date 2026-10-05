@@ -169,25 +169,37 @@ class Database:
         self,
         session_id: str,
         *,
+        expected_received_offset: int,
         received_offset: int,
         tail_b64: str,
         frames_total: int,
         last_chunk_offset: int,
         last_chunk_sha: str,
         last_response_json: str,
-    ) -> None:
-        """Durably commit one accepted append.
+    ) -> bool:
+        """Durably commit one accepted append; returns True when it won.
 
-        Offset, tail and the response of the last chunk move together in a
-        single transaction, so a crash/restart never loses or duplicates work.
+        Offset, tail, frame count, last chunk and its response move together
+        in a single statement, so they take effect as one state and a
+        crash/restart never loses or duplicates work.
+
+        The UPDATE doubles as a compare-and-swap: it only applies while the
+        session's committed ``received_offset`` is still the one this append
+        was computed from. ``received_offset`` grows strictly with every
+        committed append (chunks are non-empty), so it acts as the state
+        version. When several service instances share this database, the
+        in-process session lock cannot serialise them; this guard can. It
+        returns False when another writer committed first — the row is then
+        left untouched and the caller re-reads the newest state to decide
+        between replay and conflict.
         """
         with self.conn:
-            self.conn.execute(
+            cur = self.conn.execute(
                 "UPDATE sessions SET "
                 "received_offset = ?, tail_b64 = ?, frames_total = ?, "
                 "last_chunk_offset = ?, last_chunk_sha256 = ?, last_response = ?, "
                 "updated_at = datetime('now') "
-                "WHERE session_id = ?",
+                "WHERE session_id = ? AND received_offset = ?",
                 (
                     received_offset,
                     tail_b64,
@@ -196,5 +208,7 @@ class Database:
                     last_chunk_sha,
                     last_response_json,
                     session_id,
+                    expected_received_offset,
                 ),
             )
+        return cur.rowcount == 1
